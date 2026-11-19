@@ -1,0 +1,191 @@
+"""Greedy, lossless draft-model speculative decoding with a CUDA-graphed draft step."""
+import argparse
+import time
+from pathlib import Path
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache, StaticCache
+
+MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
+MAX_LEN = 1024
+
+
+def model_path(name):
+    p = Path(name)
+    if not p.is_dir():
+        p = MODELS_DIR / name
+    if not p.is_dir():
+        found = sorted(x.name for x in MODELS_DIR.iterdir()) if MODELS_DIR.is_dir() else []
+        raise FileNotFoundError(f"{p} not found. Contents of {MODELS_DIR}: {found}")
+    return str(p)
+
+PROMPTS = [
+    "Write a Python function that checks whether a string is a palindrome.",
+    "Explain how binary search works and give a Python implementation.",
+    "Write a Python class implementing a stack with push, pop and peek.",
+    "Explain the difference between a process and a thread.",
+    "Write a SQL query to find the second highest salary in an Employee table.",
+]
+
+
+def static_cache(model):
+    try:
+        return StaticCache(config=model.config, max_cache_len=MAX_LEN)
+    except TypeError:
+        return StaticCache(config=model.config, max_batch_size=1, max_cache_len=MAX_LEN,
+                           device=model.device, dtype=model.dtype)
+
+
+class Draft:
+    def __init__(self, model):
+        self.model = model
+        self.cache = static_cache(model)
+        self.pos = torch.arange(MAX_LEN, device=model.device)
+
+        @torch.compile(mode="reduce-overhead")
+        def _step(tok, cp):
+            logits = model(input_ids=tok, cache_position=cp,
+                           past_key_values=self.cache, use_cache=True).logits
+            return logits[:, -1].argmax(-1, keepdim=True)
+
+        self._step = _step
+
+    def prefill(self, ids):
+        self.cache.reset()
+        n = ids.shape[1]
+        self.model(input_ids=ids, cache_position=self.pos[:n], past_key_values=self.cache, use_cache=True)
+
+    def step(self, tok, p):
+        return self._step(tok, self.pos[p:p + 1]).clone()
+
+
+@torch.no_grad()
+def baseline(target, ids, max_new, eos):
+    cache = DynamicCache()
+    logits = target(ids, past_key_values=cache, use_cache=True).logits[:, -1]
+    nxt = logits.argmax(-1, keepdim=True)
+    out = [nxt]
+    for _ in range(max_new - 1):
+        if nxt.item() == eos:
+            break
+        logits = target(nxt, past_key_values=cache, use_cache=True).logits[:, -1]
+        nxt = logits.argmax(-1, keepdim=True)
+        out.append(nxt)
+    return trim(torch.cat(out, 1), max_new, eos), {}
+
+
+@torch.no_grad()
+def speculative(target, draft, ids, max_new, eos, k):
+    tc = DynamicCache()
+    logits = target(ids, past_key_values=tc, use_cache=True).logits[:, -1]
+    draft.prefill(ids)
+    seq = torch.cat([ids, logits.argmax(-1, keepdim=True)], 1)
+    plen = ids.shape[1]
+    dpos = plen
+    rounds = accepted = 0
+
+    # Invariant: target cache holds seq[:-1]; draft cache valid up to dpos
+    while seq.shape[1] - plen < max_new and not (seq[0, plen:] == eos).any():
+        n_tok = seq.shape[1]
+
+        pending = seq[:, dpos:]
+        for i in range(pending.shape[1]):
+            nxt = draft.step(pending[:, i:i + 1], dpos)
+            dpos += 1
+        drafts = [nxt]
+        for _ in range(k - 1):
+            nxt = draft.step(nxt, dpos)
+            dpos += 1
+            drafts.append(nxt)
+        d = torch.cat(drafts, 1)
+
+        v = torch.cat([seq[:, -1:], d], 1)
+        t = target(v, past_key_values=tc, use_cache=True).logits.argmax(-1)
+
+        n = int((t[:, :k] == d).int().cumprod(1).sum())
+        seq = torch.cat([seq, t[:, : n + 1]], 1)
+
+        tc.crop(n_tok + n)
+        dpos = min(dpos, n_tok + n)
+        rounds += 1
+        accepted += n
+
+    out = trim(seq[:, plen:], max_new, eos)
+    return out, {"rounds": rounds, "accepted": accepted, "drafted": rounds * k}
+
+
+def trim(tokens, max_new, eos):
+    tokens = tokens[:, :max_new]
+    hit = (tokens[0] == eos).nonzero()
+    return tokens[:, : hit[0].item() + 1] if len(hit) else tokens
+
+
+def timed(fn, *args):
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    out, stats = fn(*args)
+    torch.cuda.synchronize()
+    return out, stats, time.perf_counter() - t0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--target", default="Qwen3-32B")
+    ap.add_argument("--draft", default="Qwen3-0.6B")
+    ap.add_argument("--k", type=int, nargs="+", default=[2, 3, 4, 6])
+    ap.add_argument("--max-new", type=int, default=256)
+    ap.add_argument("--warmup", type=int, default=3)
+    a = ap.parse_args()
+
+    target_path, draft_path = model_path(a.target), model_path(a.draft)
+    tok = AutoTokenizer.from_pretrained(target_path, local_files_only=True)
+    kw = dict(torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+              device_map="cuda", local_files_only=True)
+    target = AutoModelForCausalLM.from_pretrained(target_path, **kw).eval()
+    draft = Draft(AutoModelForCausalLM.from_pretrained(draft_path, **kw).eval())
+    eos = tok.eos_token_id
+
+    def encode(p):
+        text = tok.apply_chat_template(
+            [{"role": "user", "content": p}], tokenize=False,
+            add_generation_prompt=True, enable_thinking=False)
+        return tok(text, return_tensors="pt").input_ids.cuda()
+
+    batch = [encode(p) for p in PROMPTS]
+
+    for _ in range(a.warmup):
+        baseline(target, batch[0], 32, eos)
+        for k in a.k:
+            speculative(target, draft, batch[0], 32, eos, k)
+
+    base_tok = base_time = 0
+    base_out = []
+    for ids in batch:
+        out, _, dt = timed(baseline, target, ids, a.max_new, eos)
+        base_out.append(out)
+        base_tok += out.shape[1]
+        base_time += dt
+    base_tps = base_tok / base_time
+    print(f"baseline: {base_tps:.1f} tok/s")
+
+    print(f"{'k':>3} {'tok/s':>8} {'speedup':>8} {'accept':>8} {'tok/round':>10} {'match':>6}")
+    for k in a.k:
+        n_tok = t_sum = rounds = acc = drafted = 0
+        match = 0
+        for ids, ref in zip(batch, base_out):
+            out, s, dt = timed(speculative, target, draft, ids, a.max_new, eos, k)
+            n_tok += out.shape[1]
+            t_sum += dt
+            rounds += s["rounds"]
+            acc += s["accepted"]
+            drafted += s["drafted"]
+            match += int(out.shape == ref.shape and bool((out == ref).all()))
+        tps = n_tok / t_sum
+        print(f"{k:>3} {tps:>8.1f} {tps / base_tps:>7.2f}x {acc / drafted:>8.2%} "
+              f"{(acc + rounds) / rounds:>10.2f} {match:>3}/{len(batch)}")
+
+    print(f"peak GPU memory: {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
+
+
+if __name__ == "__main__":
+    main()
