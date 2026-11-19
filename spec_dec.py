@@ -1,9 +1,22 @@
 """Greedy, lossless draft-model speculative decoding. Pretrained weights only, no training."""
 import argparse
 import time
+from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+
+MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
+
+
+def model_path(name):
+    p = Path(name)
+    if not p.is_dir():
+        p = MODELS_DIR / name
+    if not p.is_dir():
+        found = sorted(x.name for x in MODELS_DIR.iterdir()) if MODELS_DIR.is_dir() else []
+        raise FileNotFoundError(f"{p} not found. Contents of {MODELS_DIR}: {found}")
+    return str(p)
 
 PROMPTS = [
     "Write a Python function that checks whether a string is a palindrome.",
@@ -81,17 +94,19 @@ def timed(fn, *args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--target", default="Qwen/Qwen3-32B")
-    ap.add_argument("--draft", default="Qwen/Qwen3-0.6B")
+    ap.add_argument("--target", default="Qwen3-32B")
+    ap.add_argument("--draft", default="Qwen3-0.6B")
     ap.add_argument("--k", type=int, nargs="+", default=[2, 4, 6, 8])
     ap.add_argument("--max-new", type=int, default=256)
     ap.add_argument("--warmup", type=int, default=2)
     a = ap.parse_args()
 
-    tok = AutoTokenizer.from_pretrained(a.target)
-    kw = dict(torch_dtype=torch.bfloat16, attn_implementation="sdpa", device_map="cuda")
-    target = AutoModelForCausalLM.from_pretrained(a.target, **kw).eval()
-    draft = AutoModelForCausalLM.from_pretrained(a.draft, **kw).eval()
+    target_path, draft_path = model_path(a.target), model_path(a.draft)
+    tok = AutoTokenizer.from_pretrained(target_path, local_files_only=True)
+    kw = dict(torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+              device_map="cuda", local_files_only=True)
+    target = AutoModelForCausalLM.from_pretrained(target_path, **kw).eval()
+    draft = AutoModelForCausalLM.from_pretrained(draft_path, **kw).eval()
     eos = tok.eos_token_id
 
     def encode(p):
@@ -138,3 +153,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+cd /home/sr5/aman/spec_dec_cld
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu124
+python -m pip install "transformers>=4.51,<5" accelerate numpy safetensors huggingface_hub
+python -c "import torch, transformers; print(torch.__version__, transformers.__version__, torch.cuda.is_available())"
